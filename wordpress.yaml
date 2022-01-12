@@ -1,0 +1,275 @@
+---
+heat_template_version: 2016-10-14
+description: AutoScaling Wordpress
+parameters:
+  image:
+    type: string
+    description: Image used for servers
+    default: "Debian 10.11 buster"
+  key:
+    type: string
+    description: SSH key to connect to the servers
+    default: mykeypair
+  flavor:
+    type: string
+    description: flavor used by the web servers
+    default: a1-ram2-disk20-perf1
+  database_flavor:
+    type: string
+    description: flavor used by the db server
+    default: a2-ram4-disk20-perf1
+  network:
+    type: string
+    description: Network used by the server
+    default: my-wordpress-network
+  subnet_id:
+    type: string
+    description: subnet on which the load balancer will be located
+    default: my-wordpress-subnet
+  database_name:
+    type: string
+    description: Name of the wordpress DB
+    default: wordpress
+  database_user:
+    type: string
+    description: Name of the wordpress user
+    default: wordpress
+  floating_network_id:
+    type: string
+    description: UUID of a Neutron external network
+    default: ext-floating1
+
+resources:
+  # Security group
+  wordpress_security_group:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      name: "wordpress_security_group"
+      description: >
+        Allows connection from remote IP (22, 80, 443, 3306)
+      rules:
+         - { direction: ingress, protocol: tcp, port_range_min: 22, port_range_max: 22}
+         - { direction: ingress, protocol: tcp, port_range_min: 80, port_range_max: 80}
+         - { direction: ingress, protocol: tcp, port_range_min: 443, port_range_max: 443}
+         - { direction: ingress, protocol: tcp, port_range_min: 3306, port_range_max: 3306}
+  # Private Network
+  wordpress_net:
+    type: OS::Neutron::Net
+    properties:
+      name: {get_param: network}
+      value_specs:
+        mtu: 1500
+  wordpress_subnet:
+    type: OS::Neutron::Subnet
+    properties:
+      name: {get_param: subnet_id}
+      network_id: {get_resource: wordpress_net}
+      cidr: "10.11.12.0/24"
+      dns_nameservers:
+        - "84.16.67.69"
+        - "84.16.67.70"
+      ip_version: 4
+
+  wordpress_router:
+    type: OS::Neutron::Router
+    properties:
+      name:  'worpress-router'
+      external_gateway_info: { network: ext-floating1 }
+  wordpress_router_subnet_interface:
+    type: OS::Neutron::RouterInterface
+    properties:
+      router_id: {get_resource: wordpress_router}
+      subnet: {get_resource: wordpress_subnet}
+  my_wordpressdb_port:
+    type: OS::Neutron::Port
+    properties:
+      network: {get_resource: wordpress_net}
+      security_groups: [{get_resource: wordpress_security_group}]
+      fixed_ips:
+        - subnet_id: {get_resource: wordpress_subnet}
+
+  database_password:
+    type: OS::Heat::RandomString
+  database_root_password:
+    type: OS::Heat::RandomString
+  db:
+    type: OS::Nova::Server
+    properties:
+      flavor: {get_param: database_flavor}
+      image: {get_param: image}
+      key_name: {get_param: key}
+      networks:
+          - port: { get_resource: my_wordpressdb_port }
+      user_data_format: RAW
+      user_data:
+        str_replace:
+          template: |
+            #!/bin/bash -v
+            apt update
+            apt -y install mariadb-server
+            systemctl enable mariadb.service
+            sed -i s/127.0.0.1/0.0.0.0/ /etc/mysql/mariadb.conf.d/50-server.cnf
+            systemctl restart mariadb.service
+            mysqladmin -u root password $db_rootpassword
+            cat << EOF | mysql -u root --password=$db_rootpassword
+            CREATE DATABASE $db_name;
+            GRANT ALL PRIVILEGES ON $db_name.* TO "$db_user"@"%"
+            IDENTIFIED BY "$db_password";
+            FLUSH PRIVILEGES;
+            EXIT
+            EOF
+          params:
+            $db_rootpassword: {get_attr: [database_root_password, value]}
+            $db_name: {get_param: database_name}
+            $db_user: {get_param: database_user}
+            $db_password: {get_attr: [database_password, value]}
+  asg:
+    type: OS::Heat::AutoScalingGroup
+    properties:
+      min_size: 1
+      max_size: 3
+      resource:
+        type: lb_server.yaml
+        properties:
+          flavor: {get_param: flavor}
+          image: {get_param: image}
+          key_name: {get_param: key}
+          network: {get_resource: wordpress_net}
+          subnet:  {get_resource: wordpress_subnet}
+          security_groups: {get_resource: wordpress_security_group}
+          pool_id: {get_resource: pool}
+          metadata: {"metering.server_group": {get_param: "OS::stack_id"}}
+          user_data:
+            str_replace:
+              template: |
+                #!/bin/bash -v
+                apt update
+                apt -y install wget curl apache2 rsync php-gd libapache2-mod-php libapache2-mod-php7.3 php-mysql libdbd-mysql-perl default-mysql-client fail2ban
+                systemctl enable apache2.service
+                systemctl enable fail2ban
+                cd ~
+                wget http://wordpress.org/latest.tar.gz
+                tar xzvf latest.tar.gz
+                rsync -avP ~/wordpress/ /var/www/html/
+                cd /var/www/html
+                cp wp-config-sample.php wp-config.php
+                sed -i s/database_name_here/$db_name/ wp-config.php
+                sed -i s/username_here/$db_user/ wp-config.php
+                sed -i s/password_here/$db_password/ wp-config.php
+                sed -i s/localhost/$db_host/ wp-config.php
+                SALTS=$(curl -s https://api.wordpress.org/secret-key/1.1/salt/)
+                while read -r SALT; do SEARCH="define( '$(echo "$SALT" | cut -d "'" -f 2)"; REPLACE=$(echo "$SALT" | cut -d "'" -f 4); sed -i "/^$SEARCH/s/put your unique phrase here/$(echo $REPLACE | sed -e 's/\\/\\\\/g' -e 's/\//\\\//g' -e 's/&/\\\&/g')/" wp-config.php
+                done <<< "$SALTS"
+                find /var/www/html/wordpress/ -type d -exec chmod 750 {} \;
+                find /var/www/html/wordpress/ -type f -exec chmod 640 {} \;
+                chown www-data:www-data /var/www/html/ -R
+                a2enmod rewrite
+                rm -f /var/www/html/index.html
+                systemctl restart apache2.service
+                systemctl restart fail2ban
+              params:
+                $db_name: {get_param: database_name}
+                $db_user: {get_param: database_user}
+                $db_password: {get_attr: [database_password, value]}
+                $db_host: {get_attr: [db, first_address]}
+  web_server_scaleup_policy:
+    type: OS::Heat::ScalingPolicy
+    properties:
+      adjustment_type: change_in_capacity
+      auto_scaling_group_id: {get_resource: asg}
+      cooldown: 60
+      scaling_adjustment: 1
+  web_server_scaledown_policy:
+    type: OS::Heat::ScalingPolicy
+    properties:
+      adjustment_type: change_in_capacity
+      auto_scaling_group_id: {get_resource: asg}
+      cooldown: 60
+      scaling_adjustment: -1
+  cpu_alarm_high:
+    type: OS::Aodh::GnocchiAggregationByResourcesAlarm
+    properties:
+      description: Scale up if CPU > 80%
+      metric: cpu
+      aggregation_method: mean
+      granularity: 300
+      evaluation_periods: 1
+      threshold: 240000000000.0
+      resource_type: instance
+      comparison_operator: gt
+      alarm_actions:
+        - str_replace:
+            template: trust+url
+            params:
+              url: {get_attr: [web_server_scaleup_policy, signal_url]}
+      query:
+        str_replace:
+          template: '{"=": {"server_group": "stack_id"}}'
+          params:
+            stack_id: {get_param: "OS::stack_id"}
+  cpu_alarm_low:
+    type: OS::Aodh::GnocchiAggregationByResourcesAlarm
+    properties:
+      description: Scale down if CPU < 20% for 5 minutes
+      metric: cpu
+      aggregation_method: rate:mean
+      granularity: 300
+      evaluation_periods: 1
+      threshold: 60000000000.0
+      resource_type: instance
+      comparison_operator: lt
+      alarm_actions:
+        - str_replace:
+            template: trust+url
+            params:
+              url: {get_attr: [web_server_scaledown_policy, signal_url]}
+      query:
+        str_replace:
+          template: '{"=": {"server_group": "stack_id"}}'
+          params:
+            stack_id: {get_param: "OS::stack_id"}
+  lb:
+    type: OS::Octavia::LoadBalancer
+    properties:
+      vip_subnet: {get_resource: wordpress_subnet}
+  listener:
+    type: OS::Octavia::Listener
+    properties:
+      loadbalancer: {get_resource: lb}
+      protocol: HTTP
+      protocol_port: 80
+  pool:
+    type: OS::Octavia::Pool
+    properties:
+      listener: {get_resource: listener}
+      lb_algorithm: ROUND_ROBIN
+      protocol: HTTP
+      session_persistence:
+        type: SOURCE_IP
+  lb_monitor:
+    type: OS::Octavia::HealthMonitor
+    properties:
+      pool: { get_resource: pool }
+      type: HTTP
+      url_path: '/'
+      expected_codes: 200,302
+      delay: 5
+      max_retries: 5
+      timeout: 5
+  # assign a floating ip address to the load balancer
+  # pool.
+  lb_floating:
+    type: OS::Neutron::FloatingIP
+    properties:
+      floating_network_id: {get_param: floating_network_id}
+      port_id: {get_attr: [lb, vip_port_id]}
+
+outputs:
+  website_url:
+    value:
+      str_replace:
+        template: http://host
+        params:
+          host: { get_attr: [lb_floating, floating_ip_address] }
+    description: >
+      This public URL and IP that can be used to access the Wordpress site.
